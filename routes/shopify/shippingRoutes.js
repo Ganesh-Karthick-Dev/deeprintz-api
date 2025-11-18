@@ -704,6 +704,26 @@ router.post('/carrier/rates', async (req, res) => {
   try {
     console.log('🚚 CarrierService rates request received:', JSON.stringify(req.body, null, 2));
     
+    // Extract shop domain from headers (Shopify sends this)
+    const shopDomain = req.headers['x-shopify-shop-domain'] || req.headers['x-shopify-shop'];
+    
+    if (!shopDomain) {
+      console.log('❌ No shop domain in request headers');
+      return res.json({ rates: [] });
+    }
+    
+    // Get userId from shop domain
+    let userId = null;
+    try {
+      const AppProxyController = require('../../controllers/shopify/appProxyController');
+      const appProxyController = new AppProxyController();
+      userId = await appProxyController.getUserIdFromShop(shopDomain);
+      console.log('✅ Found userId from shop domain:', userId);
+    } catch (userIdError) {
+      console.error('⚠️ Could not get userId from shop domain:', userIdError.message);
+      // Continue with default - might still work if shop is configured
+    }
+    
     // Extract data from Shopify's CarrierService request
     const { rate } = req.body;
     if (!rate) {
@@ -730,7 +750,7 @@ router.post('/carrier/rates', async (req, res) => {
       totalValue = 0;
     }
     
-    console.log('📦 Calculated totals:', { totalWeight, totalValue, postalCode: destination.postal_code });
+    console.log('📦 Calculated totals:', { totalWeight, totalValue, postalCode: destination.postal_code, userId, shopDomain });
     
     // Prepare request for shipping controller
     const shippingRequest = {
@@ -740,8 +760,8 @@ router.post('/carrier/rates', async (req, res) => {
         orderAmount: totalValue,
         paymentMode: 'prepaid',
         items: items || [],
-        userId: 'default', // You might want to get this from shop domain
-        shopDomain: req.headers['x-shopify-shop-domain']
+        userId: userId || 'default',
+        shopDomain: shopDomain
       }
     };
     

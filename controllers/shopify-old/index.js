@@ -641,7 +641,12 @@ module.exports.saveShopifyProduct = async (req,res) => {
 
   }
   catch(error){
-    console.log(`error in saveSHopifyProduct controller - `,error);
+    console.log(`error in saveShopifyProduct controller - `,error);
+    return res.status(500).send({
+      status : false,
+      message : 'Internal server error while saving product',
+      error: error.message
+    })
   }
 }
 

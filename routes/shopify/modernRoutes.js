@@ -18,6 +18,7 @@ router.get('/authCallback', modernShopifyController.authCallback);
 // Modern Shopify Connection Management Routes
 router.post('/test-connection', modernShopifyController.testConnection);
 router.get('/connection-status', modernShopifyController.getConnectionStatus);
+router.post('/connection-status', modernShopifyController.getConnectionStatus); // Support POST for backward compatibility
 router.post('/disconnect', modernShopifyController.disconnect);
 
 // Modern Shopify Product Management Routes (GraphQL)

@@ -273,49 +273,6 @@ class ModernShopifyService {
       const productId = result.product.id;
       console.log('✅ Product created with ID:', productId);
 
-      // Step 1.5: Publish product to make it visible to customers
-      try {
-        const publishMutation = `
-          mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
-            publishablePublish(id: $id, input: $input) {
-              publishable {
-                ... on Product {
-                  id
-                  title
-                  publishedAt
-                }
-              }
-              userErrors {
-                field
-                message
-              }
-            }
-          }
-        `;
-
-        const publishInput = [{
-          publicationId: "gid://shopify/Publication/1" // Online Store publication
-        }];
-
-        console.log('📢 Publishing product to Online Store...');
-        const publishResponse = await client.request(publishMutation, { 
-          variables: { 
-            id: productId, 
-            input: publishInput 
-          } 
-        });
-        
-        console.log('📢 Publish response:', JSON.stringify(publishResponse, null, 2));
-        
-        if (publishResponse.data.publishablePublish.userErrors.length > 0) {
-          console.warn('⚠️ Publish warnings:', JSON.stringify(publishResponse.data.publishablePublish.userErrors));
-        } else {
-          console.log('✅ Product published successfully to Online Store');
-        }
-      } catch (publishError) {
-        console.warn('⚠️ Could not publish product (this might be normal):', publishError.message);
-      }
-
       // Step 2: Description is now included in the initial product creation
 
       // Step 2: Add options using REST API
@@ -398,12 +355,16 @@ class ModernShopifyService {
             console.log(`📦 Updating first variant for size: ${firstSizeName}`);
             
             const updateUrl = `https://${shop}/admin/api/2025-01/variants/${firstVariantId}.json`;
+            // Use actual inventoryQuantity from productData, with fallback to 0
+            const firstVariantQuantity = firstVariant.inventoryQuantity !== null && firstVariant.inventoryQuantity !== undefined
+              ? Math.max(0, parseInt(firstVariant.inventoryQuantity) || 0)
+              : 0;
             const updateData = {
               variant: {
                 id: firstVariantId,
                 price: firstVariant.price || '500.00',
                 sku: firstVariant.sku || '',
-                inventory_quantity: 999999,
+                inventory_quantity: firstVariantQuantity,
                 inventory_management: "shopify",
                 inventory_policy: "continue",
                 option1: firstSizeName
@@ -482,10 +443,11 @@ class ModernShopifyService {
                       console.warn(`⚠️ Error connecting inventory to location ${location.id}:`, connectError.message);
                     }
                     const inventoryUrl = `https://${shop}/admin/api/2025-01/inventory_levels/set.json`;
+                    // Use actual quantity from first variant
                     const inventoryData = {
                       location_id: location.id,
                       inventory_item_id: updateResult.variant.inventory_item_id,
-                      available: 999999
+                      available: firstVariantQuantity
                     };
                     
                     console.log(`📦 Setting inventory at ${location.name} (${location.country || location.country_code}):`, JSON.stringify(inventoryData, null, 2));
@@ -522,12 +484,16 @@ class ModernShopifyService {
               console.log(`📦 Creating variant ${i + 1} for size: ${sizeName}`);
               
               // Create variant using REST API
+              // Use actual inventoryQuantity from variant data, with fallback to 0
+              const variantQuantity = variant.inventoryQuantity !== null && variant.inventoryQuantity !== undefined
+                ? Math.max(0, parseInt(variant.inventoryQuantity) || 0)
+                : 0;
               const createUrl = `https://${shop}/admin/api/2025-01/products/${productId.split('/').pop()}/variants.json`;
               const variantData = {
                 variant: {
                   price: variant.price || '500.00',
                   sku: variant.sku || '',
-                  inventory_quantity: 999999,
+                  inventory_quantity: variantQuantity,
                   inventory_management: "shopify",
                   inventory_policy: "continue",
                   option1: sizeName
@@ -606,12 +572,13 @@ class ModernShopifyService {
                       } catch (connectError) {
                         console.warn(`⚠️ Error connecting inventory to location ${location.id}:`, connectError.message);
                       }
-                      const inventoryUrl = `https://${shop}/admin/api/2025-01/inventory_levels/set.json`;
-                      const inventoryData = {
-                        location_id: location.id,
-                        inventory_item_id: createResult.variant.inventory_item_id,
-                        available: 999999
-                      };
+                    const inventoryUrl = `https://${shop}/admin/api/2025-01/inventory_levels/set.json`;
+                    // Use actual quantity from variant
+                    const inventoryData = {
+                      location_id: location.id,
+                      inventory_item_id: createResult.variant.inventory_item_id,
+                      available: variantQuantity
+                    };
                       
                       console.log(`📦 Setting inventory for variant ${i + 1} at ${location.name} (${location.country || location.country_code}):`, JSON.stringify(inventoryData, null, 2));
                       
@@ -745,7 +712,130 @@ class ModernShopifyService {
         }
       }
 
-      // Step 6: Get final product with all details
+      // Step 6: Publish product to Online Store automatically using GraphQL API
+      // This MUST happen AFTER all product setup (variants, options, images, metafields) is complete
+      try {
+        console.log('📢 Starting publication process for product:', productId);
+        
+        // First, get the Online Store publication ID dynamically
+        const getPublicationsQuery = `
+          query GetPublications {
+            publications(first: 10) {
+              edges {
+                node {
+                  id
+                  name
+                }
+              }
+            }
+          }
+        `;
+
+        console.log('📋 Fetching publications to find Online Store...');
+        const publicationsResponse = await client.request(getPublicationsQuery);
+        console.log('📋 Publications response:', JSON.stringify(publicationsResponse, null, 2));
+        
+        let onlineStorePublicationId = null;
+        if (publicationsResponse.data?.publications?.edges) {
+          const onlineStorePub = publicationsResponse.data.publications.edges.find(
+            edge => edge.node.name === 'Online Store'
+          );
+          if (onlineStorePub) {
+            onlineStorePublicationId = onlineStorePub.node.id;
+            console.log('✅ Found Online Store publication ID:', onlineStorePublicationId);
+          } else {
+            console.warn('⚠️ Online Store publication not found. Available publications:');
+            publicationsResponse.data.publications.edges.forEach(edge => {
+              console.log(`  - ${edge.node.name}: ${edge.node.id}`);
+            });
+            // Try to use the first publication if Online Store is not found by name
+            if (publicationsResponse.data.publications.edges.length > 0) {
+              onlineStorePublicationId = publicationsResponse.data.publications.edges[0].node.id;
+              console.log('⚠️ Using first available publication as fallback:', onlineStorePublicationId);
+            }
+          }
+        }
+
+        if (!onlineStorePublicationId) {
+          console.error('❌ Online Store publication ID not found. Cannot publish product.');
+          throw new Error('Online Store publication not found');
+        }
+
+        // Publish the product to Online Store using GraphQL mutation
+        const publishMutation = `
+          mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {
+            publishablePublish(id: $id, input: $input) {
+              publishable {
+                ... on Product {
+                  id
+                  title
+                  publishedAt
+                }
+              }
+              userErrors {
+                field
+                message
+              }
+            }
+          }
+        `;
+
+        const publishInput = [{
+          publicationId: onlineStorePublicationId
+        }];
+
+        console.log('📢 Publishing product to Online Store...');
+        console.log('📢 Product ID:', productId);
+        console.log('📢 Publication ID:', onlineStorePublicationId);
+        console.log('📢 Publish variables:', JSON.stringify({ id: productId, input: publishInput }, null, 2));
+        
+        const publishResponse = await client.request(publishMutation, { 
+          variables: { 
+            id: productId, 
+            input: publishInput 
+          } 
+        });
+        
+        console.log('📢 Publish response:', JSON.stringify(publishResponse, null, 2));
+        
+        if (publishResponse.errors) {
+          console.error('❌ GraphQL errors in publish response:', JSON.stringify(publishResponse.errors, null, 2));
+          throw new Error(`GraphQL errors: ${JSON.stringify(publishResponse.errors)}`);
+        }
+
+        if (publishResponse.data?.publishablePublish?.userErrors?.length > 0) {
+          const errors = publishResponse.data.publishablePublish.userErrors;
+          console.error('❌ Publish userErrors:', JSON.stringify(errors, null, 2));
+          throw new Error(`Publish errors: ${JSON.stringify(errors)}`);
+        }
+
+        // Check if publishing was successful
+        // The response should have publishablePublish with either publishable or no errors
+        if (publishResponse.data?.publishablePublish) {
+          if (publishResponse.data.publishablePublish.publishable) {
+            console.log('✅ Product published successfully to Online Store');
+            console.log('✅ Published product details:', JSON.stringify(publishResponse.data.publishablePublish.publishable, null, 2));
+          } else {
+            // If there's no publishable but also no errors, it might still be successful
+            // Some Shopify API versions return success without the publishable object
+            console.log('✅ Product publish request completed (no errors detected)');
+            console.log('📢 Full publish response:', JSON.stringify(publishResponse.data.publishablePublish, null, 2));
+          }
+        } else {
+          console.warn('⚠️ Publish response did not return expected data structure');
+          console.warn('⚠️ Full response:', JSON.stringify(publishResponse, null, 2));
+          throw new Error('Publish response did not return expected data structure');
+        }
+      } catch (publishError) {
+        console.error('❌ Error publishing product to Online Store:', publishError.message);
+        console.error('Publish error details:', publishError);
+        console.error('❌ Product was created but NOT published to Online Store. Manual publishing may be required.');
+        // Don't throw - allow product creation to succeed even if publishing fails
+        // The product can be manually published later if needed
+        // But log it clearly so we know publishing failed
+      }
+
+      // Step 7: Get final product with all details
       const getProductMutation = `
         query getProduct($id: ID!) {
           product(id: $id) {

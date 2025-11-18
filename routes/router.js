@@ -22,6 +22,7 @@ const returnsController = require('../controllers/return/returnController.js')
 const woocommerceController = require('../controllers/woocommerce/index.js')
 const woocommerceWebhookController = require('../controllers/woocommerce/webhooks.js')
 const modernShopifyRoutes = require('./shopify/modernRoutes.js')
+const shopifyOldController = require('../controllers/shopify-old/index.js')
 const deleteTestOrderControllers = require('../service/deleteTestOrder.js')
 const crypto = require('crypto');
 
@@ -386,5 +387,12 @@ router.use('/shopify', modernShopifyRoutes);
 // 🚚 Shopify Shipping Integration Routes
 const shopifyShippingRoutes = require('./shopify/shippingRoutes');
 router.use('/shopify', shopifyShippingRoutes);
+
+// 📦 Old Shopify API Routes (for backward compatibility)
+router.post('/getShopifyProducts', shopifyOldController.getShopifyProducts);
+router.post('/deleteShopifyProducts', shopifyOldController.deleteShopifyProducts);
+router.post('/deleteShopifyProduct', shopifyOldController.deleteShopifyProducts); // Alias for frontend compatibility
+router.post('/saveShopifyProduct', shopifyOldController.saveShopifyProduct);
+router.post('/updateShopifyProduct', shopifyOldController.updateUserProduct);
 
 module.exports = router

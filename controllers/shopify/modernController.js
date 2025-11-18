@@ -353,9 +353,22 @@ class ModernShopifyController {
         // Extract userId from state parameter (format: "state:userId")
         let userId = req.session?.shopify_userid;
         if (!userId && req.query.state) {
-          const stateParts = req.query.state.split(':');
+          // Clean the state - remove any JSON artifacts
+          let cleanState = req.query.state;
+          
+          // If state contains JSON-like structure, extract the actual state value
+          if (cleanState.includes('","state":"')) {
+            // Extract the first part before the JSON artifact
+            cleanState = cleanState.split('","state":"')[0];
+          }
+          
+          // Split by colon to get userId
+          const stateParts = cleanState.split(':');
           if (stateParts.length > 1) {
-            userId = stateParts[1];
+            // Extract userId and ensure it's a clean number
+            userId = stateParts[1].trim();
+            // Remove any non-numeric characters that might have been included
+            userId = userId.replace(/[^0-9]/g, '');
             console.log('Extracted userId from state:', userId);
           }
         }
@@ -719,14 +732,16 @@ class ModernShopifyController {
   // Get connection status
   async getConnectionStatus(req, res) {
     try {
-      console.log('📊 Modern Shopify connection status request:', req.query);
+      console.log('📊 Modern Shopify connection status request:', req.query || req.body);
 
-      const { userId } = req.query;
+      // Support both GET (query) and POST (body) requests
+      const userId = req.query?.userId || req.body?.userid;
 
       if (!userId) {
         return res.status(400).json({
           success: false,
-          message: 'Missing required parameter: userId'
+          status: false,
+          message: 'Missing required parameter: userId/userid'
         });
       }
 
@@ -734,9 +749,17 @@ class ModernShopifyController {
       const shopResult = await this.getShopConnection(userId);
 
       if (shopResult.success) {
+        // Return format compatible with both modern and old frontend
         res.json({
           success: true,
-          message: 'Connection status retrieved successfully',
+          status: true,
+          message: 'Shopify Connection Exist',
+          response: {
+            store_url: shopResult.shop.shop_domain,
+            store_access_token: shopResult.shop.access_token,
+            shop_name: shopResult.shop.shop_name
+          },
+          // Also include modern format for future use
           data: {
             connected: true,
             shop: shopResult.shop,
@@ -746,7 +769,9 @@ class ModernShopifyController {
       } else {
         res.json({
           success: true,
-          message: 'No active connection found',
+          status: false,
+          message: 'No Shopify Connection Exist',
+          response: null,
           data: {
             connected: false,
             connection_status: 'disconnected'
@@ -757,6 +782,7 @@ class ModernShopifyController {
       console.error('❌ Error in modern getConnectionStatus:', error);
       res.status(500).json({
         success: false,
+        status: false,
         message: 'Internal server error',
         error: error.message
       });
@@ -768,29 +794,43 @@ class ModernShopifyController {
     try {
       console.log('🔌 Modern Shopify disconnect request:', req.body);
 
-      const { userId, shopDomain } = req.body;
+      const { userId, userid, shopDomain } = req.body;
+      const finalUserId = userId || userid; // Support both formats
 
-      if (!userId || !shopDomain) {
+      if (!finalUserId) {
         return res.status(400).json({
           success: false,
-          message: 'Missing required fields: userId, shopDomain'
+          message: 'Missing required field: userId/userid'
         });
       }
 
-      // Disconnect shop
-      const result = await global.dbConnection('shopify_stores')
-        .where('vendor_id', userId)
-        .where('shop_domain', shopDomain)
-        .update({
-          status: 'disconnected',
-          access_token: null,
-          updated_at: new Date()
-        });
+      // If shopDomain is provided, disconnect specific shop
+      // Otherwise, disconnect all shops for this user
+      let query = global.dbConnection('shopify_stores')
+        .where('vendor_id', finalUserId)
+        .where('status', 'connected');
+
+      if (shopDomain) {
+        query = query.where('shop_domain', shopDomain);
+      }
+
+      // Get shops before disconnecting for response
+      const shops = await query.clone().select('shop_domain', 'shop_name');
+
+      // Disconnect shop(s) - don't set access_token to null (column doesn't allow null)
+      // Just update status to disconnected
+      const result = await query.update({
+        status: 'disconnected',
+        updated_at: new Date()
+      });
 
       if (result > 0) {
         res.json({
           success: true,
-          message: 'Shop disconnected successfully'
+          message: shopDomain 
+            ? 'Shop disconnected successfully' 
+            : `${result} shop(s) disconnected successfully`,
+          disconnected_shops: shops.map(s => s.shop_domain)
         });
       } else {
         res.status(400).json({
@@ -910,13 +950,17 @@ class ModernShopifyController {
       const hasVariants = product.variants && product.variants.length > 0;
 
       // Prepare product data for Shopify (similar to WooCommerce structure)
+      // Determine status from productstatus (Active/Inactive) or default to ACTIVE
+      const productStatus = product.productstatus === 'Active' ? 'ACTIVE' : 
+                           product.productstatus === 'Inactive' ? 'DRAFT' : 'ACTIVE';
+      
       const shopifyProductData = {
         title: product.productname,
         description: product.productdesc || '',
-        productType: 'Print-on-Demand',
-        vendor: 'Deeprintz',
-        tags: ['print-on-demand', 'custom-design'],
-        status: 'ACTIVE',
+        productType: 'Print-on-Demand', // Can be made dynamic if product type is available
+        vendor: 'Deeprintz', // Can be made dynamic if vendor is available
+        tags: ['print-on-demand', 'custom-design'], // Can be enhanced with product tags if available
+        status: productStatus,
         images: product.designurl ? [
           {
             src: product.designurl,
@@ -951,38 +995,79 @@ class ModernShopifyController {
       if (hasVariants) {
         console.log("🔍 Processing variants:", JSON.stringify(product.variants, null, 2));
 
+        // Group variants by size (similar to EditProductModal logic)
+        // This ensures we create one Shopify variant per size, summing quantities for all colors
+        const variantsBySize = {};
+        product.variants.forEach(variant => {
+          const size = variant.size || 'Default';
+          if (!variantsBySize[size]) {
+            variantsBySize[size] = {
+              size: size,
+              sizeid: variant.sizeid,
+              sizesku: variant.sizesku,
+              variants: [],
+              totalQuantity: 0,
+              retailPrice: variant.retailPrice || variant.price || product.shopifyProductCost || "0"
+            };
+          }
+          variantsBySize[size].variants.push(variant);
+          
+          // Sum quantities for all variants of this size
+          const qty = variant.quantity;
+          if (qty !== null && qty !== undefined) {
+            variantsBySize[size].totalQuantity += Math.max(0, parseInt(qty) || 0);
+          }
+          
+          // Use the first non-zero retailPrice found for this size
+          if (!variantsBySize[size].retailPrice || variantsBySize[size].retailPrice === "0") {
+            const variantPrice = variant.retailPrice || variant.price;
+            if (variantPrice && variantPrice !== "0") {
+              variantsBySize[size].retailPrice = variantPrice.toString();
+            }
+          }
+        });
+
+        // Get unique sizes for options
+        const uniqueSizes = Object.keys(variantsBySize);
+        
         // Add size option
         shopifyProductData.options = [
           {
             name: 'Size',
-            values: product.variants.map(variant => variant.size)
+            values: uniqueSizes
           }
         ];
 
-        // Create variants for each size with proper pricing (use original prices as INR)
-        shopifyProductData.variants = product.variants.map(variant => {
-          const price = variant.retailPrice || variant.price || product.shopifyProductCost || "0";
-          const sku = `DP-${product.deeprintzProductId}-${variant.sizesku || variant.size}-${Date.now()}`;
+        // Create one variant per size with summed quantities
+        shopifyProductData.variants = uniqueSizes.map(size => {
+          const sizeGroup = variantsBySize[size];
+          const price = sizeGroup.retailPrice || product.shopifyProductCost || "0";
+          const sku = `DP-${product.deeprintzProductId}-${sizeGroup.sizesku || size}-${Date.now()}`;
+          const quantity = sizeGroup.totalQuantity;
 
-          console.log(`📦 Creating variant: ${variant.size} - INR Price: ${price} - SKU: ${sku}`);
+          console.log(`📦 Creating variant for size ${size}: Price: ${price} - SKU: ${sku} - Total Quantity: ${quantity} (from ${sizeGroup.variants.length} color variants)`);
 
           return {
             price: price.toString(),
             sku: sku,
-            inventoryQuantity: 999999
+            inventoryQuantity: quantity
           };
         });
       } else {
         // Simple product without variants (use original price as INR)
         const price = product.variants?.[0]?.retailPrice || product.shopifyProductCost || "0";
         const sku = `DP-${product.deeprintzProductId}-${Date.now()}`;
+        // Use actual quantity from first variant if available, otherwise 0
+        const quantity = product.variants?.[0]?.quantity !== null && product.variants?.[0]?.quantity !== undefined
+          ? Math.max(0, parseInt(product.variants[0].quantity) || 0)
+          : 0;
 
-        console.log(`📦 Creating simple product - INR Price: ${price} - SKU: ${sku}`);
+        console.log(`📦 Creating simple product - INR Price: ${price} - SKU: ${sku} - Quantity: ${quantity}`);
 
         shopifyProductData.variants = [{
           price: price.toString(),
           sku: sku,
-          inventoryQuantity: 999999
+          inventoryQuantity: quantity
         }];
       }
 
@@ -1028,16 +1113,32 @@ class ModernShopifyController {
         try {
           console.log('🚚 Setting up automatic shipping for Shopify product...');
 
-          // 1. Setup shipping calculator script (most important)
+          // 1. Register CarrierService (REQUIRED for Shopify to show shipping options)
+          // This tells Shopify to call our API for shipping rates
+          try {
+            await this.registerCarrierService(shop.shop_domain, shop.access_token);
+            console.log('✅ CarrierService registered successfully');
+          } catch (carrierError) {
+            // If carrier service already exists, that's okay
+            if (carrierError.response?.status === 422 || carrierError.message?.includes('already exists')) {
+              console.log('ℹ️ CarrierService already registered, continuing...');
+            } else {
+              console.error('⚠️ Failed to register CarrierService:', carrierError.message);
+              // Continue anyway - might already be registered
+            }
+          }
+
+          // 2. Setup shipping calculator script (for enhanced checkout experience)
           await this.setupShippingCalculatorForVendor(shop, userId);
 
-          // 2. Setup shipping webhooks
+          // 3. Setup shipping webhooks
           await this.setupShippingWebhooksForVendor(shop, userId);
 
-          // 3. Store shipping configuration
+          // 4. Store shipping configuration
           await this.storeShippingConfiguration(userId, shop.shop_domain, {
             configured_at: new Date().toISOString(),
-            method: 'app_proxy',
+            method: 'carrier_service',
+            carrier_service_url: `https://devapi.deeprintz.com/api/deeprintz/live/shopify/carrier/rates`,
             script_url: `https://devapi.deeprintz.com/tools/app-proxy/shipping/script?userId=${userId}&shop=${shop.shop_domain}`
           });
 
@@ -2046,7 +2147,7 @@ class ModernShopifyController {
           format: "json"
         }
       };
-
+      
       const response = await axios.post(
         `https://${shop}/admin/api/2024-10/carrier_services.json`,
         carrierServiceData,

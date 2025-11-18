@@ -157,7 +157,7 @@ module.exports.getWishlist = async(req,res) => {
         } 
 
         if (errors.length > 0) {
-            return res.status().send({
+            return res.status(400).send({
                 status: false,
                 message: "Validation failed.",
                 errors: errors

@@ -259,19 +259,18 @@ module.exports.getShopifyProducts = async (props) => {
 
         // Get variants for each product
         await Promise.all(shopifyProducts.map(async product => {
-            // Normalize shopify_variants
+            // Normalize shopify_variants (saved variants with retailPrice)
+            let savedVariants = [];
             if (product.shopify_variants && product.shopify_variants.trim() !== "") {
                 try {
-                    product.shopify_variants = JSON.parse(product.shopify_variants);
+                    savedVariants = JSON.parse(product.shopify_variants);
                 } catch (e) {
-                    product.shopify_variants = []; // fallback if JSON is invalid
+                    savedVariants = []; // fallback if JSON is invalid
                 }
-            } else {
-                product.shopify_variants = [];
             }
         
             if (product.productid) {
-                // get variants
+                // get variants from productvariants table
                 const variants = await global.dbConnection('productvariants')
                     .leftJoin('app_types', 'app_types.apptypeid', 'productvariants.varianttype1')
                     .leftJoin('app_types as app_types2', 'app_types2.apptypeid', 'productvariants.varianttype2')
@@ -297,7 +296,49 @@ module.exports.getShopifyProducts = async (props) => {
                     )
                     .where('productid', product.productid);
         
-                product.variants = variants;
+                // Merge saved variants (with retailPrice) with productvariants data
+                // Create a map of saved variants by variantid for exact match
+                const savedVariantsMap = {};
+                savedVariants.forEach(savedVariant => {
+                    if (savedVariant.variantid) {
+                        savedVariantsMap[savedVariant.variantid] = savedVariant;
+                    }
+                });
+        
+                // Also create a map by size+colorid as fallback
+                const savedVariantsBySizeColor = {};
+                savedVariants.forEach(savedVariant => {
+                    const size = savedVariant.size;
+                    const colorid = savedVariant.colorid;
+                    if (size && colorid) {
+                        const key = `${size}_${colorid}`;
+                        if (!savedVariantsBySizeColor[key]) {
+                            savedVariantsBySizeColor[key] = savedVariant;
+                        }
+                    }
+                });
+        
+                // Merge retailPrice from saved variants into productvariants
+                const mergedVariants = variants.map(variant => {
+                    // Try exact match by variantid first
+                    let savedVariant = savedVariantsMap[variant.variantid];
+                    
+                    // Fallback to size+colorid match
+                    if (!savedVariant && variant.size && variant.colorid) {
+                        const key = `${variant.size}_${variant.colorid}`;
+                        savedVariant = savedVariantsBySizeColor[key];
+                    }
+                    
+                    if (savedVariant && savedVariant.retailPrice !== undefined && savedVariant.retailPrice !== null) {
+                        return {
+                            ...variant,
+                            retailPrice: savedVariant.retailPrice
+                        };
+                    }
+                    return variant;
+                });
+        
+                product.variants = mergedVariants;
         
                 // product images
                 const images = await global.dbConnection('productimages')
@@ -344,6 +385,7 @@ module.exports.getShopifyProducts = async (props) => {
 module.exports.getShopifyProductById = async (productId) => {
     try {
       let shopifyProducts = await global.dbConnection('shopify_products')
+        .leftJoin('products', 'products.productid', 'shopify_products.productid')
         .select(
           'shopify_products.id as shopifyProductId',
           'shopify_products.productid as deeprintzProductId',
@@ -354,7 +396,8 @@ module.exports.getShopifyProductById = async (productId) => {
           'shopify_products.position',
           'shopify_products.width',
           'shopify_products.height',
-          'shopify_products.designurl'
+          'shopify_products.designurl',
+          'products.productstatus'
         )
         .where('shopify_products.id', productId)
         .first(); // since productId is unique
@@ -362,19 +405,88 @@ module.exports.getShopifyProductById = async (productId) => {
       if (!shopifyProducts) return false;
   
       // Parse variants if stored as JSON string
+      let savedVariants = [];
       if (shopifyProducts.variants) {
         try {
-          shopifyProducts.variants = JSON.parse(shopifyProducts.variants);
+          savedVariants = JSON.parse(shopifyProducts.variants);
         } catch (e) {
           console.error("Error parsing variants JSON:", e);
-          shopifyProducts.variants = [];
+          savedVariants = [];
         }
+      }
+
+      // If product has productid, fetch actual variant data from productvariants table
+      if (shopifyProducts.deeprintzProductId) {
+        const variants = await global.dbConnection('productvariants')
+          .leftJoin('app_types', 'app_types.apptypeid', 'productvariants.varianttype1')
+          .leftJoin('app_types as app_types2', 'app_types2.apptypeid', 'productvariants.varianttype2')
+          .leftJoin('app_types as app_types3', 'app_types3.apptypeid', 'productvariants.varianttype')
+          .select(
+            "productvariants.productid",
+            "productvariants.variantid",
+            "app_types.typename as color",
+            "app_types.apptypeid as colorid",
+            "app_types.code as colorcode",
+            "app_types2.typename as size",
+            "app_types2.apptypeid as sizeid",
+            "app_types2.sku as sizesku",
+            "app_types3.typename as printingtype",
+            "app_types3.apptypeid as printingtypeid",
+            "productvariants.variantsku",
+            "productvariants.weight",
+            "productvariants.unit",
+            "productvariants.price",
+            "productvariants.status",
+            "productvariants.quantity",
+            "productvariants.tax"
+          )
+          .where('productid', shopifyProducts.deeprintzProductId);
+
+        // Merge saved variants (with retailPrice) with productvariants data
+        const savedVariantsMap = {};
+        savedVariants.forEach(savedVariant => {
+          if (savedVariant.variantid) {
+            savedVariantsMap[savedVariant.variantid] = savedVariant;
+          }
+        });
+
+        const savedVariantsBySizeColor = {};
+        savedVariants.forEach(savedVariant => {
+          const size = savedVariant.size;
+          const colorid = savedVariant.colorid;
+          if (size && colorid) {
+            const key = `${size}_${colorid}`;
+            if (!savedVariantsBySizeColor[key]) {
+              savedVariantsBySizeColor[key] = savedVariant;
+            }
+          }
+        });
+
+        // Merge retailPrice and other data from saved variants into productvariants
+        shopifyProducts.variants = variants.map(variant => {
+          let savedVariant = savedVariantsMap[variant.variantid];
+          
+          if (!savedVariant && variant.size && variant.colorid) {
+            const key = `${variant.size}_${variant.colorid}`;
+            savedVariant = savedVariantsBySizeColor[key];
+          }
+          
+          if (savedVariant && savedVariant.retailPrice !== undefined && savedVariant.retailPrice !== null) {
+            return {
+              ...variant,
+              retailPrice: savedVariant.retailPrice
+            };
+          }
+          return variant;
+        });
+      } else {
+        shopifyProducts.variants = savedVariants;
       }
   
       return shopifyProducts;
   
     } catch (error) {
-      console.log(`error in getShopifyProducts service - `, error);
+      console.log(`error in getShopifyProductById service - `, error);
       return false;
     }
 };

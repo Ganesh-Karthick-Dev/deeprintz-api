@@ -13,7 +13,8 @@ include_config_on_deploy = true
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_products,read_products,write_orders,read_orders,read_customers,write_customers"
+# Required scopes matching Shopify app configuration
+scopes = "read_customers,read_fulfillments,write_fulfillments,write_inventory,read_inventory,read_locations,read_orders,write_orders,read_product_listings,write_product_listings,read_products,write_products,read_publications,write_publications"
 
 # Ensure that "use_legacy_install_flow" is set to false or is omitted from this TOML file to use Shopify managed installation.
 use_legacy_install_flow = false

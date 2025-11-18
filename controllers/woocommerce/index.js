@@ -982,6 +982,7 @@ module.exports.getConnectionStatus = async (req, res) => {
       status: true,
       response: {
         store_url: store.store_url,
+        store_name: store.store_name || store.store_url.replace(/^https?:\/\//, '').replace(/\/$/, ''),
         consumer_key: store.consumer_key,
         consumer_secret: store.consumer_secret,
         vendor_id: store.user_id,
